@@ -1,36 +1,111 @@
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Experimental.Rendering.Universal;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
-using UnityEngine.Rendering.Universal.Internal;
 
 public class RenderMetaballsScreenSpace : ScriptableRendererFeature
 {
     class RenderMetaballsDepthPass : ScriptableRenderPass
     {
-        const string MetaballDepthRTId = "_MetaballDepthRT";
-        int _metaballDepthRTId;
         public Material WriteDepthMaterial;
+        public TextureHandle DepthTextureHandle { get; private set; }
 
-        RenderTargetIdentifier _metaballDepthRT;
-        RenderStateBlock _renderStateBlock;
         RenderQueueType _renderQueueType;
         FilteringSettings _filteringSettings;
-        ProfilingSampler _profilingSampler;
         List<ShaderTagId> _shaderTagIdList = new List<ShaderTagId>();
 
-        public RenderMetaballsDepthPass(string profilerTag, RenderPassEvent renderPassEvent,
-            string[] shaderTags, RenderQueueType renderQueueType, int layerMask)
-        {
-            profilingSampler = new ProfilingSampler(nameof(RenderObjectsPass));
+        private class PassData { public RendererListHandle rendererList; }
 
-            _profilingSampler = new ProfilingSampler(profilerTag);
+        public RenderMetaballsDepthPass(RenderPassEvent renderPassEvent, string[] shaderTags, RenderQueueType renderQueueType, int layerMask)
+        {
             this.renderPassEvent = renderPassEvent;
             this._renderQueueType = renderQueueType;
-            RenderQueueRange renderQueueRange = (renderQueueType == RenderQueueType.Transparent)
-                ? RenderQueueRange.transparent
-                : RenderQueueRange.opaque;
+            RenderQueueRange renderQueueRange = (renderQueueType == RenderQueueType.Transparent) ? RenderQueueRange.transparent : RenderQueueRange.opaque;
+            _filteringSettings = new FilteringSettings(renderQueueRange, layerMask);
+
+            if (shaderTags != null && shaderTags.Length > 0)
+            {
+                foreach (var passName in shaderTags)
+                    _shaderTagIdList.Add(new ShaderTagId(passName));
+            }
+            else
+            {
+                _shaderTagIdList.Add(new ShaderTagId("SRPDefaultUnlit"));
+                _shaderTagIdList.Add(new ShaderTagId("UniversalForward"));
+                _shaderTagIdList.Add(new ShaderTagId("UniversalForwardOnly"));
+                _shaderTagIdList.Add(new ShaderTagId("LightweightForward"));
+            }
+        }
+
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+        {
+            UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+            UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
+
+            TextureDesc desc = new TextureDesc(cameraData.cameraTargetDescriptor.width, cameraData.cameraTargetDescriptor.height);
+            desc.colorFormat = cameraData.cameraTargetDescriptor.graphicsFormat;
+            desc.depthBufferBits = DepthBits.None;
+            desc.msaaSamples = MSAASamples.None; // Force NO MSAA pour éviter les crashs
+            desc.name = "_MetaballDepthRT";
+            DepthTextureHandle = renderGraph.CreateTexture(desc);
+
+            TextureDesc depthDesc = new TextureDesc(cameraData.cameraTargetDescriptor.width, cameraData.cameraTargetDescriptor.height);
+            depthDesc.colorFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.None;
+            depthDesc.depthBufferBits = DepthBits.Depth32;
+            depthDesc.msaaSamples = MSAASamples.None;
+            depthDesc.name = "_MetaballDepthRT_ZBuffer";
+            TextureHandle zBuffer = renderGraph.CreateTexture(depthDesc);
+
+            using (var builder = renderGraph.AddRasterRenderPass<PassData>("Metaballs Depth Pass", out var passData))
+            {
+                builder.SetRenderAttachment(DepthTextureHandle, 0, AccessFlags.Write);
+                builder.SetRenderAttachmentDepth(zBuffer, AccessFlags.Write);
+
+                SortingCriteria sortingCriteria = (_renderQueueType == RenderQueueType.Transparent) ? SortingCriteria.CommonTransparent : cameraData.defaultOpaqueSortFlags;
+                DrawingSettings drawingSettings = new DrawingSettings(_shaderTagIdList[0], new SortingSettings(cameraData.camera) { criteria = sortingCriteria })
+                {
+                    overrideMaterial = WriteDepthMaterial
+                };
+                for (int i = 1; i < _shaderTagIdList.Count; i++)
+                    drawingSettings.SetShaderPassName(i, _shaderTagIdList[i]);
+
+                RendererListParams listParams = new RendererListParams(renderingData.cullResults, drawingSettings, _filteringSettings);
+                passData.rendererList = renderGraph.CreateRendererList(listParams);
+                builder.UseRendererList(passData.rendererList);
+
+                builder.SetRenderFunc((PassData data, RasterGraphContext context) =>
+                {
+                    RasterCommandBuffer cmd = context.cmd;
+                    cmd.ClearRenderTarget(RTClearFlags.All, Color.clear, 1, 0);
+                    cmd.DrawRendererList(data.rendererList);
+                });
+            }
+        }
+    }
+
+    class RenderMetaballsScreenSpacePass : ScriptableRenderPass
+    {
+        public Material BlitMaterial;
+        public int BlurPasses;
+        public float BlurDistance;
+        public RenderMetaballsDepthPass DepthPass;
+
+        Material _blurMaterial;
+        Material _blitCopyDepthMaterial;
+        RenderQueueType _renderQueueType;
+        FilteringSettings _filteringSettings;
+        List<ShaderTagId> _shaderTagIdList = new List<ShaderTagId>();
+
+        private class DrawPassData { public RendererListHandle rendererList; public TextureHandle cameraDepth; public Material copyDepthMat; }
+        private class BlurPassData { public TextureHandle sourceTex; public TextureHandle depthTex; public Material blurMat; public float offset; public float blurDistance; }
+        private class BlitPassData { public TextureHandle sourceTex; public Material blitMat; }
+
+        public RenderMetaballsScreenSpacePass(RenderPassEvent renderPassEvent, string[] shaderTags, RenderQueueType renderQueueType, int layerMask)
+        {
+            this.renderPassEvent = renderPassEvent;
+            this._renderQueueType = renderQueueType;
+            RenderQueueRange renderQueueRange = (renderQueueType == RenderQueueType.Transparent) ? RenderQueueRange.transparent : RenderQueueRange.opaque;
             _filteringSettings = new FilteringSettings(renderQueueRange, layerMask);
 
             if (shaderTags != null && shaderTags.Length > 0)
@@ -46,219 +121,124 @@ public class RenderMetaballsScreenSpace : ScriptableRendererFeature
                 _shaderTagIdList.Add(new ShaderTagId("LightweightForward"));
             }
 
-            _renderStateBlock = new RenderStateBlock(RenderStateMask.Nothing);
-        }
-
-        public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
-        {
-            RenderTextureDescriptor blitTargetDescriptor = renderingData.cameraData.cameraTargetDescriptor;
-
-            _metaballDepthRTId = Shader.PropertyToID(MetaballDepthRTId);
-            cmd.GetTemporaryRT(_metaballDepthRTId, blitTargetDescriptor);
-            _metaballDepthRT = new RenderTargetIdentifier(_metaballDepthRTId);
-            ConfigureTarget(_metaballDepthRT);
-            ConfigureClear(ClearFlag.All, Color.clear);
-        }
-
-        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
-        {
-            SortingCriteria sortingCriteria = (_renderQueueType == RenderQueueType.Transparent)
-                ? SortingCriteria.CommonTransparent
-                : renderingData.cameraData.defaultOpaqueSortFlags;
-
-            DrawingSettings drawingSettings =
-                CreateDrawingSettings(_shaderTagIdList, ref renderingData, sortingCriteria);
-
-            // NOTE: Do NOT mix ProfilingScope with named CommandBuffers i.e. CommandBufferPool.Get("name").
-            // Currently there's an issue which results in mismatched markers.
-            CommandBuffer cmd = CommandBufferPool.Get();
-            using (new ProfilingScope(cmd, _profilingSampler))
-            {
-                //Write Depth
-                drawingSettings.overrideMaterial = WriteDepthMaterial;
-                context.DrawRenderers(renderingData.cullResults, ref drawingSettings, ref _filteringSettings,
-                    ref _renderStateBlock);
-            }
-
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-        }
-    }
-
-    class RenderMetaballsScreenSpacePass : ScriptableRenderPass
-    {
-        const string MetaballRTId = "_MetaballRT";
-        const string MetaballRT2Id = "_MetaballRT2";
-        const string MetaballDepthRTId = "_MetaballDepthRT";
-
-        int _metaballRTId;
-        int _metaballRT2Id;
-        int _metaballDepthRTId;
-
-        public Material BlitMaterial;
-        Material _blurMaterial;
-        Material _blitCopyDepthMaterial;
-
-        public int BlurPasses;
-        public float BlurDistance;
-
-        RenderTargetIdentifier _metaballRT;
-        RenderTargetIdentifier _metaballRT2;
-        RenderTargetIdentifier _metaballDepthRT;
-        RenderTargetIdentifier _cameraTargetId;
-        RenderTargetIdentifier _cameraDepthTargetId;
-
-        RenderQueueType _renderQueueType;
-        FilteringSettings _filteringSettings;
-        ProfilingSampler _profilingSampler;
-
-        List<ShaderTagId> ShaderTagIdList = new List<ShaderTagId>();
-
-        RenderStateBlock _renderStateBlock;
-
-        public RenderMetaballsScreenSpacePass(string profilerTag, RenderPassEvent renderPassEvent,
-            string[] shaderTags,
-            RenderQueueType renderQueueType, int layerMask)
-        {
-            profilingSampler = new ProfilingSampler(nameof(RenderObjectsPass));
-
-            _profilingSampler = new ProfilingSampler(profilerTag);
-            this.renderPassEvent = renderPassEvent;
-            this._renderQueueType = renderQueueType;
-            RenderQueueRange renderQueueRange = (renderQueueType == RenderQueueType.Transparent)
-                ? RenderQueueRange.transparent
-                : RenderQueueRange.opaque;
-            _filteringSettings = new FilteringSettings(renderQueueRange, layerMask);
-
-            if (shaderTags != null && shaderTags.Length > 0)
-            {
-                foreach (var passName in shaderTags)
-                    ShaderTagIdList.Add(new ShaderTagId(passName));
-            }
-            else
-            {
-                ShaderTagIdList.Add(new ShaderTagId("SRPDefaultUnlit"));
-                ShaderTagIdList.Add(new ShaderTagId("UniversalForward"));
-                ShaderTagIdList.Add(new ShaderTagId("UniversalForwardOnly"));
-                ShaderTagIdList.Add(new ShaderTagId("LightweightForward"));
-            }
-
-            _renderStateBlock = new RenderStateBlock(RenderStateMask.Nothing);
-
             _blitCopyDepthMaterial = new Material(Shader.Find("Hidden/BlitToDepth"));
             _blurMaterial = new Material(Shader.Find("Hidden/KawaseBlur"));
         }
 
-        // This method is called before executing the render pass.
-        // It can be used to configure render targets and their clear state. Also to create temporary render target textures.
-        // When empty this render pass will render to the active camera render target.
-        // You should never call CommandBuffer.SetRenderTarget. Instead call <c>ConfigureTarget</c> and <c>ConfigureClear</c>.
-        // The render pipeline will ensure target setup and clearing happens in a performant manner.
-        public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
         {
-            RenderTextureDescriptor blitTargetDescriptor = renderingData.cameraData.cameraTargetDescriptor;
-            blitTargetDescriptor.colorFormat = RenderTextureFormat.ARGB32;
+            UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+            UniversalRenderingData renderingData = frameData.Get<UniversalRenderingData>();
+            UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
 
-            var renderer = renderingData.cameraData.renderer;
+            TextureHandle cameraColor = resourceData.activeColorTexture;
+            TextureHandle cameraDepth = resourceData.activeDepthTexture;
+            TextureHandle metaballDepthRT = DepthPass.DepthTextureHandle;
 
-            _metaballRTId = Shader.PropertyToID(MetaballRTId);
-            _metaballRT2Id = Shader.PropertyToID(MetaballRT2Id);
-            _metaballDepthRTId = Shader.PropertyToID(MetaballDepthRTId);
+            TextureDesc colorDesc = new TextureDesc(cameraData.cameraTargetDescriptor.width, cameraData.cameraTargetDescriptor.height);
+            colorDesc.colorFormat = cameraData.cameraTargetDescriptor.graphicsFormat;
+            colorDesc.depthBufferBits = DepthBits.None;
+            colorDesc.msaaSamples = MSAASamples.None; // Force NO MSAA
+            colorDesc.filterMode = FilterMode.Bilinear;
 
-            cmd.GetTemporaryRT(_metaballRTId, blitTargetDescriptor, FilterMode.Bilinear);
-            cmd.GetTemporaryRT(_metaballRT2Id, blitTargetDescriptor, FilterMode.Bilinear);
+            colorDesc.name = "_MetaballRT";
+            TextureHandle metaballRT = renderGraph.CreateTexture(colorDesc);
 
-            _metaballRT = new RenderTargetIdentifier(_metaballRTId);
-            _metaballRT2 = new RenderTargetIdentifier(_metaballRT2Id);
-            _metaballDepthRT = new RenderTargetIdentifier(_metaballDepthRTId);
+            colorDesc.name = "_MetaballRT2";
+            TextureHandle metaballRT2 = renderGraph.CreateTexture(colorDesc);
 
-            ConfigureTarget(_metaballRT);
+            TextureDesc depthDesc = new TextureDesc(cameraData.cameraTargetDescriptor.width, cameraData.cameraTargetDescriptor.height);
+            depthDesc.colorFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.None;
+            depthDesc.depthBufferBits = DepthBits.Depth32;
+            depthDesc.msaaSamples = MSAASamples.None; // Force NO MSAA
+            depthDesc.name = "_MetaballCustomDepth";
+            TextureHandle customDepthRT = renderGraph.CreateTexture(depthDesc);
 
-            _cameraTargetId = renderer.cameraColorTarget;
-            _cameraDepthTargetId = new RenderTargetIdentifier("_CameraDepthTexture"); // renderer.cameraDepthTarget;
-        }
-
-        // Here you can implement the rendering logic.
-        // Use <c>ScriptableRenderContext</c> to issue drawing commands or execute command buffers
-        // https://docs.unity3d.com/ScriptReference/Rendering.ScriptableRenderContext.html
-        // You don't have to call ScriptableRenderContext.submit, the render pipeline will call it at specific points in the pipeline.
-        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
-        {
-            SortingCriteria sortingCriteria = (_renderQueueType == RenderQueueType.Transparent)
-                ? SortingCriteria.CommonTransparent
-                : renderingData.cameraData.defaultOpaqueSortFlags;
-
-            DrawingSettings drawingSettings =
-                CreateDrawingSettings(ShaderTagIdList, ref renderingData, sortingCriteria);
-
-            // NOTE: Do NOT mix ProfilingScope with named CommandBuffers i.e. CommandBufferPool.Get("name").
-            // Currently there's an issue which results in mismatched markers.
-            CommandBuffer cmd = CommandBufferPool.Get();
-            using (new ProfilingScope(cmd, _profilingSampler))
+            using (var builder = renderGraph.AddRasterRenderPass<DrawPassData>("Metaballs Draw Setup", out var passData))
             {
-                //Clear small RT
-                cmd.ClearRenderTarget(true, true, Color.clear);
-                context.ExecuteCommandBuffer(cmd);
-                cmd.Clear();
+                builder.SetRenderAttachment(metaballRT, 0, AccessFlags.Write);
+                builder.SetRenderAttachmentDepth(customDepthRT, AccessFlags.Write);
 
-                //Blit Camera Depth Texture
-                Blit(cmd, _cameraDepthTargetId, _metaballRT, _blitCopyDepthMaterial);
-                context.ExecuteCommandBuffer(cmd);
-                cmd.Clear();
+                builder.UseTexture(cameraDepth, AccessFlags.Read);
+                passData.cameraDepth = cameraDepth;
+                passData.copyDepthMat = _blitCopyDepthMaterial;
 
-                //Draw to RT
-                context.DrawRenderers(renderingData.cullResults, ref drawingSettings, ref _filteringSettings,
-                    ref _renderStateBlock);
-                context.ExecuteCommandBuffer(cmd);
-                cmd.Clear();
+                SortingCriteria sortingCriteria = (_renderQueueType == RenderQueueType.Transparent) ? SortingCriteria.CommonTransparent : cameraData.defaultOpaqueSortFlags;
+                DrawingSettings drawingSettings = new DrawingSettings(_shaderTagIdList[0], new SortingSettings(cameraData.camera) { criteria = sortingCriteria });
+                for (int i = 1; i < _shaderTagIdList.Count; i++) drawingSettings.SetShaderPassName(i, _shaderTagIdList[i]);
 
-                //Blur
-                cmd.SetGlobalTexture("_BlurDepthTex", _metaballDepthRT);
-                cmd.SetGlobalFloat("_BlurDistance", BlurDistance);
-                float offset = 1.5f;
-                cmd.SetGlobalFloat("_Offset", offset);
-                Blit(cmd, _metaballRT, _metaballRT2, _blurMaterial);
-                context.ExecuteCommandBuffer(cmd);
-                cmd.Clear();
-                
-                var tmpRT = _metaballRT;
-                _metaballRT = _metaballRT2;
-                _metaballRT2 = tmpRT;
+                RendererListParams listParams = new RendererListParams(renderingData.cullResults, drawingSettings, _filteringSettings);
+                passData.rendererList = renderGraph.CreateRendererList(listParams);
+                builder.UseRendererList(passData.rendererList);
 
-                for (int i = 1; i < BlurPasses; ++i)
+                builder.SetRenderFunc((DrawPassData data, RasterGraphContext context) =>
                 {
-                    offset += 1.0f;
-                    cmd.SetGlobalFloat("_Offset", offset);
-                    Blit(cmd, _metaballRT, _metaballRT2, _blurMaterial);
-                    context.ExecuteCommandBuffer(cmd);
-                    cmd.Clear();
-
-                    tmpRT = _metaballRT;
-                    _metaballRT = _metaballRT2;
-                    _metaballRT2 = tmpRT;
-                }
-
-                //Draw to Camera Target
-                Blit(cmd, _metaballRT, _cameraTargetId, BlitMaterial);
+                    RasterCommandBuffer cmd = context.cmd;
+                    cmd.ClearRenderTarget(RTClearFlags.All, Color.clear, 1, 0);
+                    Blitter.BlitTexture(cmd, data.cameraDepth, new Vector4(1, 1, 0, 0), data.copyDepthMat, 0);
+                    cmd.DrawRendererList(data.rendererList);
+                });
             }
 
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-        }
+            TextureHandle currentSource = metaballRT;
+            TextureHandle currentDest = metaballRT2;
+            float offset = 1.5f;
 
-        // Cleanup any allocated resources that were created during the execution of this render pass.
-        public override void OnCameraCleanup(CommandBuffer cmd)
-        {
-            cmd.ReleaseTemporaryRT(_metaballRTId);
-            cmd.ReleaseTemporaryRT(_metaballRT2Id);
-            cmd.ReleaseTemporaryRT(_metaballDepthRTId);
+            for (int i = 0; i < BlurPasses; i++)
+            {
+                using (var builder = renderGraph.AddRasterRenderPass<BlurPassData>($"Metaballs Blur Pass {i}", out var passData))
+                {
+                    builder.SetRenderAttachment(currentDest, 0, AccessFlags.Write);
+
+                    builder.UseTexture(currentSource, AccessFlags.Read);
+                    passData.sourceTex = currentSource;
+
+                    builder.UseTexture(metaballDepthRT, AccessFlags.Read);
+                    passData.depthTex = metaballDepthRT;
+
+                    passData.blurMat = _blurMaterial;
+                    passData.offset = offset;
+                    passData.blurDistance = BlurDistance;
+
+                    builder.SetRenderFunc((BlurPassData data, RasterGraphContext context) =>
+                    {
+                        RasterCommandBuffer cmd = context.cmd;
+                        data.blurMat.SetTexture("_BlurDepthTex", data.depthTex);
+                        data.blurMat.SetFloat("_BlurDistance", data.blurDistance);
+                        data.blurMat.SetFloat("_Offset", data.offset);
+
+                        Blitter.BlitTexture(cmd, data.sourceTex, new Vector4(1, 1, 0, 0), data.blurMat, 0);
+                    });
+                }
+
+                offset += (i == 0) ? 0f : 1.0f;
+                TextureHandle tmp = currentSource;
+                currentSource = currentDest;
+                currentDest = tmp;
+            }
+
+            using (var builder = renderGraph.AddRasterRenderPass<BlitPassData>("Metaballs Final Blit", out var passData))
+            {
+                builder.SetRenderAttachment(cameraColor, 0, AccessFlags.Write);
+
+                builder.UseTexture(currentSource, AccessFlags.Read);
+                passData.sourceTex = currentSource;
+
+                passData.blitMat = BlitMaterial;
+
+                builder.SetRenderFunc((BlitPassData data, RasterGraphContext context) =>
+                {
+                    Blitter.BlitTexture(context.cmd, data.sourceTex, new Vector4(1, 1, 0, 0), data.blitMat, 0);
+                });
+            }
         }
     }
 
     public string PassTag = "RenderMetaballsScreenSpace";
     public RenderPassEvent Event = RenderPassEvent.AfterRenderingOpaques;
 
-    public RenderObjects.FilterSettings FilterSettings = new RenderObjects.FilterSettings();
+    // Cette classe est déclarée dans RenderMetaballs.cs pour tout le projet !
+    public CustomFilterSettings FilterSettings = new CustomFilterSettings();
 
     public Material BlitMaterial;
     public Material WriteDepthMaterial;
@@ -266,32 +246,25 @@ public class RenderMetaballsScreenSpace : ScriptableRendererFeature
     RenderMetaballsDepthPass _renderMetaballsDepthPass;
     RenderMetaballsScreenSpacePass _scriptableMetaballsScreenSpacePass;
 
-    [Range(1, 15)]
-    public int BlurPasses = 1;
+    [Range(1, 15)] public int BlurPasses = 1;
+    [Range(0f, 1f)] public float BlurDistance = 0.5f;
 
-    [Range(0f, 1f)]
-    public float BlurDistance = 0.5f;
-
-    /// <inheritdoc/>
     public override void Create()
     {
-        _renderMetaballsDepthPass = new RenderMetaballsDepthPass(PassTag, Event, FilterSettings.PassNames,
-            FilterSettings.RenderQueueType, FilterSettings.LayerMask)
+        _renderMetaballsDepthPass = new RenderMetaballsDepthPass(Event, FilterSettings.PassNames, FilterSettings.RenderQueueType, FilterSettings.LayerMask)
         {
             WriteDepthMaterial = WriteDepthMaterial
         };
 
-        _scriptableMetaballsScreenSpacePass = new RenderMetaballsScreenSpacePass(PassTag, Event,
-            FilterSettings.PassNames, FilterSettings.RenderQueueType, FilterSettings.LayerMask)
+        _scriptableMetaballsScreenSpacePass = new RenderMetaballsScreenSpacePass(Event, FilterSettings.PassNames, FilterSettings.RenderQueueType, FilterSettings.LayerMask)
         {
             BlitMaterial = BlitMaterial,
             BlurPasses = BlurPasses,
-            BlurDistance = BlurDistance
+            BlurDistance = BlurDistance,
+            DepthPass = _renderMetaballsDepthPass
         };
     }
 
-    // Here you can inject one or multiple render passes in the renderer.
-    // This method is called when setting up the renderer once per-camera.
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
         renderer.EnqueuePass(_renderMetaballsDepthPass);
